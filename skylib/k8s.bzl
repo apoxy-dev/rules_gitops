@@ -274,6 +274,7 @@ def k8s_deploy(
             common_labels = common_labels,
             common_annotations = common_annotations,
             patches = patches,
+            objects = objects,
             image_name_patches = image_name_patches,
             image_tag_patches = image_tag_patches,
             openapi_path = openapi_path,
