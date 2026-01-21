@@ -289,6 +289,17 @@ def k8s_deploy(
             tags = tags,
             visibility = visibility,
         )
+        kubectl(
+            name = name + ".delete",
+            srcs = [name],
+            command = "delete",
+            cluster = cluster,
+            push = False,
+            user = user,
+            namespace = namespace,
+            tags = tags,
+            visibility = visibility,
+        )
         kustomize_gitops(
             name = name + ".gitops",
             srcs = [name],
