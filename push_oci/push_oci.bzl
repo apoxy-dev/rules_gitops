@@ -4,11 +4,13 @@ Implementation of the `k8s_push` rule based on rules_oci
 
 load("@bazel_skylib//rules:write_file.bzl", "write_file")
 
-# TODO: remove this once rules_oci is updated
 # buildifier: disable=bzl-visibility
-load("@rules_oci//oci/private:push.bzl", "oci_push_lib")
+load("@rules_oci//oci/private:util.bzl", "util")
 load("//gitops:provider.bzl", "GitopsPushInfo")
 load("//skylib:runfile.bzl", "get_runfile_path")
+
+def _quote_args(args):
+    return ["\"{}\"".format(arg) for arg in args]
 
 def _impl(ctx):
     if GitopsPushInfo in ctx.attr.image:
@@ -64,8 +66,55 @@ def _impl(ctx):
             ),
         ]
 
-    default_info = oci_push_lib.implementation(ctx = ctx)
+    # Get toolchain providers - no transition so single targets, not lists
+    crane = ctx.attr._crane[platform_common.ToolchainInfo]
+    jq = ctx.attr._jq[platform_common.ToolchainInfo]
 
+    if ctx.attr.repository and ctx.attr.repository_file:
+        fail("must specify exactly one of 'repository_file' or 'repository'")
+
+    if not ctx.file.image.is_directory:
+        fail("image attribute must be a oci_image or oci_image_index")
+
+    _, _, _, maybe_digest, maybe_tag = util.parse_image(ctx.attr.repository)
+    if maybe_digest or maybe_tag:
+        fail("`repository` attribute should not contain digest or tag. got: {}".format(ctx.attr.repository))
+
+    executable = ctx.actions.declare_file("push_%s.sh" % ctx.label.name)
+    files = [ctx.file.image]
+    substitutions = {
+        "{{crane_path}}": crane.crane_info.binary.short_path,
+        "{{jq_path}}": jq.jqinfo.bin.short_path,
+        "{{image_dir}}": ctx.file.image.short_path,
+        "{{fixed_args}}": "",
+    }
+
+    if ctx.attr.repository:
+        substitutions["{{fixed_args}}"] += " ".join(_quote_args(["--repository", ctx.attr.repository]))
+    elif ctx.attr.repository_file:
+        files.append(ctx.file.repository_file)
+        substitutions["{{repository_file}}"] = ctx.file.repository_file.short_path
+    else:
+        fail("must specify exactly one of 'repository_file' or 'repository'")
+
+    if ctx.attr.remote_tags:
+        files.append(ctx.file.remote_tags)
+        substitutions["{{tags}}"] = ctx.file.remote_tags.short_path
+
+    ctx.actions.expand_template(
+        template = ctx.file._push_sh_tpl,
+        output = executable,
+        is_executable = True,
+        substitutions = substitutions,
+    )
+    runfiles = ctx.runfiles(files = files)
+    runfiles = runfiles.merge(jq.default.default_runfiles)
+    runfiles = runfiles.merge(ctx.attr.image[DefaultInfo].default_runfiles)
+    runfiles = runfiles.merge(crane.default.default_runfiles)
+
+    default_info = DefaultInfo(executable = util.maybe_wrap_launcher_for_windows(ctx, executable), runfiles = runfiles)
+
+    # Extract digest for GitopsPushInfo
     jq_bin = ctx.toolchains["@aspect_bazel_lib//lib:jq_toolchain_type"].jqinfo.bin
     digest = ctx.actions.declare_file(ctx.attr.name + ".digest")
     ctx.actions.run_shell(
@@ -81,22 +130,58 @@ def _impl(ctx):
         default_info,
         GitopsPushInfo(
             image_label = ctx.attr.image.label,
-            # registry = registry,
             repository = ctx.attr.repository,
             digestfile = digest,
         ),
     ]
 
+# Override _crane and _jq to use host platform instead of target platform.
+# This fixes "Exec format error" when running push scripts locally with
+# cross-platform builds (e.g., building linux_amd64 on darwin_arm64).
+# The original rules_oci attrs use cfg=_transition_to_target which forces
+# execution platform to match target platform.
+_push_oci_attrs = {
+    "image": attr.label(
+        allow_single_file = True,
+        doc = "Label to an oci_image or oci_image_index",
+        mandatory = True,
+    ),
+    "repository": attr.string(
+        doc = "Repository URL where the image will be signed at, e.g.: `index.docker.io/<user>/image`. Digests and tags are not allowed.",
+    ),
+    "repository_file": attr.label(
+        doc = "The same as 'repository' but in a file. This allows pushing to different repositories based on stamping.",
+        allow_single_file = True,
+    ),
+    "remote_tags": attr.label(
+        doc = "a text file containing tags, one per line.",
+        allow_single_file = True,
+    ),
+    "_crane": attr.label(
+        default = "@oci_crane_toolchains//:current_toolchain",
+    ),
+    "_jq": attr.label(
+        default = "@jq_toolchains//:resolved_toolchain",
+    ),
+    "_push_sh_tpl": attr.label(
+        default = "@rules_oci//oci/private:push.sh.tpl",
+        allow_single_file = True,
+    ),
+    "_tag_tpl": attr.label(
+        default = Label("//push_oci:tag.sh.tpl"),
+        allow_single_file = True,
+    ),
+    "_windows_constraint": attr.label(default = "@platforms//os:windows"),
+}
+
 push_oci_rule = rule(
     implementation = _impl,
-    attrs = oci_push_lib.attrs |
-            {"_tag_tpl": attr.label(
-                default = Label("//push_oci:tag.sh.tpl"),
-                allow_single_file = True,
-            )},
-    toolchains = ["@aspect_bazel_lib//lib:jq_toolchain_type"] + oci_push_lib.toolchains,
+    attrs = _push_oci_attrs,
+    toolchains = [
+        "@aspect_bazel_lib//lib:jq_toolchain_type",
+        "@bazel_tools//tools/sh:toolchain_type",
+    ],
     executable = True,
-    # provides = [GitopsPushInfo, DefaultInfo],
 )
 
 def push_oci(
